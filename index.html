@@ -115,19 +115,46 @@
     overflow: hidden;
   }
 
-  #status-bar {
+  #controls-bar {
     padding: 8px 12px;
     background: #222;
-    font-size: 0.85rem;
-    color: #888;
     display: flex;
     justify-content: space-between;
     align-items: center;
     flex-shrink: 0;
+    gap: 8px;
   }
 
-  #status-bar .active { color: #4caf50; }
-  #status-bar .error { color: #f44336; }
+  #status-text {
+    font-size: 0.85rem;
+    color: #888;
+    flex: 1;
+    word-break: break-word;
+  }
+
+  #status-text.active { color: #4caf50; }
+  #status-text.error { color: #f44336; }
+
+  #plate-count {
+    font-size: 0.85rem;
+    color: #888;
+    white-space: nowrap;
+  }
+
+  #pause-btn {
+    padding: 6px 16px;
+    font-size: 0.85rem;
+    border: 1px solid #555;
+    border-radius: 8px;
+    background: #333;
+    color: #fff;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  #pause-btn.running { border-color: #f44336; color: #f44336; }
+  #pause-btn.paused { border-color: #4caf50; color: #4caf50; }
 
   #plate-log {
     flex: 1;
@@ -188,8 +215,9 @@
 </div>
 
 <div id="bottom-panel">
-  <div id="status-bar">
+  <div id="controls-bar">
     <span id="status-text">Ready</span>
+    <button id="pause-btn" style="display:none;">Pause</button>
     <span id="plate-count">0 plates</span>
   </div>
   <div id="plate-log"></div>
@@ -221,6 +249,7 @@ const apiKeyInput = document.getElementById('api-key-input');
 const statusText = document.getElementById('status-text');
 const plateCount = document.getElementById('plate-count');
 const plateLog = document.getElementById('plate-log');
+const pauseBtn = document.getElementById('pause-btn');
 
 // ─── Audio: generate a short alert beep ─────────────────────────────────
 function playAlert() {
@@ -308,7 +337,7 @@ function formatPlate(digits) {
 
 // ─── Gemini API call ────────────────────────────────────────────────────
 async function extractPlates(imageBase64) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${state.apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${state.apiKey}`;
 
   const body = {
     contents: [{
@@ -456,6 +485,27 @@ async function showAlert(digits, shk) {
   state.paused = false;
 }
 
+// ─── Pause / Resume ─────────────────────────────────────────────────────
+pauseBtn.addEventListener('click', () => {
+  if (state.running) {
+    // Pause
+    state.running = false;
+    clearInterval(state.captureInterval);
+    video.pause();
+    pauseBtn.textContent = 'Resume';
+    pauseBtn.className = 'paused';
+    setStatus('Paused', '');
+  } else {
+    // Resume
+    video.play();
+    state.running = true;
+    state.captureInterval = setInterval(captureAndProcess, 1000);
+    pauseBtn.textContent = 'Pause';
+    pauseBtn.className = 'running';
+    setStatus('Watching...', 'active');
+  }
+});
+
 // ─── Start ──────────────────────────────────────────────────────────────
 startBtn.addEventListener('click', async () => {
   const key = apiKeyInput.value.trim();
@@ -475,6 +525,9 @@ startBtn.addEventListener('click', async () => {
     await video.play();
 
     startScreen.style.display = 'none';
+    pauseBtn.style.display = 'inline-block';
+    pauseBtn.textContent = 'Pause';
+    pauseBtn.className = 'running';
     setStatus('Watching...', 'active');
     state.running = true;
 
