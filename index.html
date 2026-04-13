@@ -464,6 +464,7 @@ startBtn.addEventListener('click', async () => {
     return;
   }
   state.apiKey = key;
+  localStorage.setItem('shlak_api_key', key);
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -484,8 +485,8 @@ startBtn.addEventListener('click', async () => {
   }
 });
 
-// Pre-fill API key from hardcoded value (for convenience)
-apiKeyInput.value = 'AIzaSyBZ_Q-pE7MwYfOYv1T6D-5Ql3Jik7fmaUA';
+// Restore API key from localStorage if previously entered
+apiKeyInput.value = localStorage.getItem('shlak_api_key') || '';
 </script>
 </body>
 </html>
