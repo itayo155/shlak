@@ -156,6 +156,43 @@
   #pause-btn.running { border-color: #f44336; color: #f44336; }
   #pause-btn.paused { border-color: #4caf50; color: #4caf50; }
 
+  #settings-bar {
+    padding: 4px 12px;
+    background: #1e1e1e;
+    display: none;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+    font-size: 0.8rem;
+    color: #888;
+  }
+
+  #settings-bar label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+
+  #settings-bar input[type="range"] {
+    width: 80px;
+    accent-color: #ffd700;
+  }
+
+  #zoom-label {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    z-index: 5;
+    pointer-events: none;
+    display: none;
+  }
+
   #plate-log {
     flex: 1;
     overflow-y: auto;
@@ -207,6 +244,8 @@
     <div class="plate-number" id="overlay-number"></div>
   </div>
 
+  <span id="zoom-label"></span>
+
   <div id="start-screen">
     <h1>Shlak Spotter</h1>
     <input type="text" id="api-key-input" placeholder="Gemini API Key" />
@@ -219,6 +258,10 @@
     <span id="status-text">Ready</span>
     <button id="pause-btn" style="display:none;">Pause</button>
     <span id="plate-count">0 plates</span>
+  </div>
+  <div id="settings-bar">
+    <label>Rate: <input type="range" id="rate-slider" min="0.5" max="2" step="0.1" value="1"> <span id="rate-value">1.0s</span></label>
+    <label>Zoom: <input type="range" id="zoom-slider" min="1" max="1" step="0.1" value="1"> <span id="zoom-value">1.0x</span></label>
   </div>
   <div id="plate-log"></div>
 </div>
@@ -250,6 +293,12 @@ const statusText = document.getElementById('status-text');
 const plateCount = document.getElementById('plate-count');
 const plateLog = document.getElementById('plate-log');
 const pauseBtn = document.getElementById('pause-btn');
+const rateSlider = document.getElementById('rate-slider');
+const rateValue = document.getElementById('rate-value');
+const zoomSlider = document.getElementById('zoom-slider');
+const zoomValue = document.getElementById('zoom-value');
+const zoomLabel = document.getElementById('zoom-label');
+const settingsBar = document.getElementById('settings-bar');
 
 // ─── Audio: generate a short alert beep ─────────────────────────────────
 function playAlert() {
@@ -304,11 +353,8 @@ function detectShlaklak(digits) {
     let tailRun = 0;
     for (let i = n - 1; i >= 0 && digits[i] === digits[n - 1]; i--) tailRun++;
     const cyclicRun = headRun + tailRun;
-    if (cyclicRun > bestRun) {
-      bestRun = cyclicRun;
-      bestDigit = digits[0];
-      // Mark as cyclic
-      return { run: bestRun, digit: bestDigit, cyclic: true };
+    if (cyclicRun > bestRun && cyclicRun >= 3) {
+      return { run: cyclicRun, digit: digits[0], cyclic: true };
     }
   }
 
@@ -343,7 +389,7 @@ async function extractPlates(imageBase64) {
     contents: [{
       parts: [
         {
-          text: `Look at this image and find any Israeli vehicle license plates. Israeli plates contain only digits (7 or 8 digits). Return ONLY the digit sequences, one per line, no dashes or spaces. If no plates are visible, return "NONE". Do not include any other text.`
+          text: `Look at this image carefully and find ALL Israeli vehicle license plates visible. There may be multiple plates (e.g. parked cars on a street). Israeli plates contain only digits, 7 or 8 digits total. Return ONLY the digit sequences, one per line, no dashes, spaces, or other text. If no plates are visible, return "NONE".`
         },
         {
           inlineData: {
@@ -485,6 +531,84 @@ async function showAlert(digits, shk) {
   state.paused = false;
 }
 
+// ─── Rate slider ────────────────────────────────────────────────────────
+function getRate() {
+  return parseFloat(rateSlider.value) * 1000;
+}
+
+rateSlider.addEventListener('input', () => {
+  rateValue.textContent = parseFloat(rateSlider.value).toFixed(1) + 's';
+  if (state.running) {
+    clearInterval(state.captureInterval);
+    state.captureInterval = setInterval(captureAndProcess, getRate());
+  }
+});
+
+// ─── Zoom (pinch + slider) ──────────────────────────────────────────────
+let zoomMin = 1, zoomMax = 1, currentZoom = 1;
+
+function applyZoom(z) {
+  currentZoom = Math.max(zoomMin, Math.min(zoomMax, z));
+  zoomSlider.value = currentZoom;
+  zoomValue.textContent = currentZoom.toFixed(1) + 'x';
+  const track = video.srcObject?.getVideoTracks()[0];
+  if (track) {
+    track.applyConstraints({ advanced: [{ zoom: currentZoom }] });
+  }
+}
+
+function initZoom(stream) {
+  const track = stream.getVideoTracks()[0];
+  const caps = track.getCapabilities?.();
+  if (caps?.zoom) {
+    zoomMin = caps.zoom.min;
+    zoomMax = caps.zoom.max;
+    currentZoom = track.getSettings?.()?.zoom || zoomMin;
+    zoomSlider.min = zoomMin;
+    zoomSlider.max = zoomMax;
+    zoomSlider.step = (zoomMax - zoomMin) > 20 ? 0.5 : 0.1;
+    zoomSlider.value = currentZoom;
+    zoomValue.textContent = currentZoom.toFixed(1) + 'x';
+  }
+}
+
+zoomSlider.addEventListener('input', () => {
+  applyZoom(parseFloat(zoomSlider.value));
+});
+
+// Pinch-to-zoom on camera area
+let pinchStartDist = 0, pinchStartZoom = 1;
+const cameraContainer = document.getElementById('camera-container');
+
+cameraContainer.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 2) {
+    e.preventDefault();
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    pinchStartDist = Math.hypot(dx, dy);
+    pinchStartZoom = currentZoom;
+  }
+}, { passive: false });
+
+cameraContainer.addEventListener('touchmove', (e) => {
+  if (e.touches.length === 2) {
+    e.preventDefault();
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    const dist = Math.hypot(dx, dy);
+    const scale = dist / pinchStartDist;
+    applyZoom(pinchStartZoom * scale);
+    zoomLabel.style.display = 'block';
+    zoomLabel.textContent = currentZoom.toFixed(1) + 'x';
+  }
+}, { passive: false });
+
+cameraContainer.addEventListener('touchend', (e) => {
+  if (e.touches.length < 2) {
+    setTimeout(() => { zoomLabel.style.display = 'none'; }, 1000);
+  }
+});
+
 // ─── Pause / Resume ─────────────────────────────────────────────────────
 pauseBtn.addEventListener('click', () => {
   if (state.running) {
@@ -499,7 +623,7 @@ pauseBtn.addEventListener('click', () => {
     // Resume
     video.play();
     state.running = true;
-    state.captureInterval = setInterval(captureAndProcess, 1000);
+    state.captureInterval = setInterval(captureAndProcess, getRate());
     pauseBtn.textContent = 'Pause';
     pauseBtn.className = 'running';
     setStatus('Watching...', 'active');
@@ -523,16 +647,18 @@ startBtn.addEventListener('click', async () => {
     });
     video.srcObject = stream;
     await video.play();
+    initZoom(stream);
 
     startScreen.style.display = 'none';
     pauseBtn.style.display = 'inline-block';
     pauseBtn.textContent = 'Pause';
     pauseBtn.className = 'running';
+    settingsBar.style.display = 'flex';
     setStatus('Watching...', 'active');
     state.running = true;
 
     // Start capture loop
-    state.captureInterval = setInterval(captureAndProcess, 1000);
+    state.captureInterval = setInterval(captureAndProcess, getRate());
   } catch (err) {
     alert('Camera error: ' + err.message);
   }
