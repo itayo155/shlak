@@ -208,6 +208,8 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    flex-wrap: wrap;
+    gap: 2px 8px;
   }
 
   .log-entry.normal {
@@ -300,75 +302,131 @@ const zoomValue = document.getElementById('zoom-value');
 const zoomLabel = document.getElementById('zoom-label');
 const settingsBar = document.getElementById('settings-bar');
 
-// ─── Audio: generate a short alert beep ─────────────────────────────────
+// ─── Audio ──────────────────────────────────────────────────────────────
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
 function playAlert() {
   try {
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    // Two-tone alert
-    [660, 880].forEach((freq, i) => {
-      const osc = audioCtx.createOscillator();
-      const gain = audioCtx.createGain();
+    const ctx = ensureAudio();
+    // Three-tone rising alert
+    [523, 659, 784].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
       osc.connect(gain);
-      gain.connect(audioCtx.destination);
+      gain.connect(ctx.destination);
       osc.frequency.value = freq;
-      osc.type = 'square';
-      gain.gain.value = 0.15;
-      osc.start(audioCtx.currentTime + i * 0.15);
-      osc.stop(audioCtx.currentTime + i * 0.15 + 0.12);
+      osc.type = 'triangle';
+      gain.gain.setValueAtTime(0.25, ctx.currentTime + i * 0.18);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + i * 0.18 + 0.16);
+      osc.start(ctx.currentTime + i * 0.18);
+      osc.stop(ctx.currentTime + i * 0.18 + 0.18);
     });
-  } catch (e) {
-    // Audio not available
-  }
+  } catch (e) {}
 }
 
-// ─── Shlaklak detection ─────────────────────────────────────────────────
-function detectShlaklak(digits) {
-  // digits is a string of 7 or 8 digits
+// ─── Detection: single-digit shlaklak (3+ identical digits) ─────────────
+function detectSingleShlaklak(digits) {
   const n = digits.length;
   let bestRun = 0;
-  let bestDigit = '';
 
-  // Linear scan: find longest run of identical consecutive digits
   let run = 1;
   for (let i = 1; i < n; i++) {
-    if (digits[i] === digits[i - 1]) {
-      run++;
-    } else {
-      if (run > bestRun) {
-        bestRun = run;
-        bestDigit = digits[i - 1];
-      }
-      run = 1;
-    }
+    if (digits[i] === digits[i - 1]) run++;
+    else { bestRun = Math.max(bestRun, run); run = 1; }
   }
-  if (run > bestRun) {
-    bestRun = run;
-    bestDigit = digits[n - 1];
+  bestRun = Math.max(bestRun, run);
+
+  let cyclic = false;
+  if (digits[0] === digits[n - 1]) {
+    let head = 0;
+    while (head < n && digits[head] === digits[0]) head++;
+    let tail = 0;
+    while (tail < n && digits[n - 1 - tail] === digits[n - 1]) tail++;
+    const wrap = head + tail;
+    if (wrap > bestRun && wrap >= 3) { bestRun = wrap; cyclic = true; }
   }
 
-  // Cyclic check: if first and last digits match, the run wraps around
-  if (n > 0 && digits[0] === digits[n - 1] && bestRun < n) {
-    let headRun = 0;
-    for (let i = 0; i < n && digits[i] === digits[0]; i++) headRun++;
-    let tailRun = 0;
-    for (let i = n - 1; i >= 0 && digits[i] === digits[n - 1]; i--) tailRun++;
-    const cyclicRun = headRun + tailRun;
-    if (cyclicRun > bestRun && cyclicRun >= 3) {
-      return { run: cyclicRun, digit: digits[0], cyclic: true };
-    }
-  }
-
-  if (bestRun >= 3) {
-    return { run: bestRun, digit: bestDigit, cyclic: false };
-  }
-  return null;
+  return bestRun >= 3 ? { run: bestRun, cyclic } : null;
 }
 
-function shlaklakName(run, cyclic) {
-  // 3 = shlaklak, 4 = shlaklaklak, etc.
-  const laks = 'lak'.repeat(run - 1);
-  const name = 'sh' + laks;
-  return cyclic ? name + ' (cyclic)' : name;
+// ─── Detection: pair shlaklak (2-digit pattern repeating 3+ times) ──────
+function detectPairShlaklak(digits) {
+  const n = digits.length;
+  let bestCount = 0, bestPair = '', bestCyclic = false;
+  const maxReps = Math.floor(n / 2);
+
+  for (let start = 0; start < n; start++) {
+    const a = digits[start], b = digits[(start + 1) % n];
+    if (a === b) continue; // same-digit pairs covered by single shlaklak
+
+    let count = 1;
+    for (let k = 1; k < maxReps; k++) {
+      if (digits[(start + 2 * k) % n] === a && digits[(start + 2 * k + 1) % n] === b) count++;
+      else break;
+    }
+
+    if (count >= 3 && count > bestCount) {
+      bestCount = count;
+      bestPair = a + b;
+      bestCyclic = (start + 2 * count) > n;
+    }
+  }
+
+  return bestCount >= 3 ? { count: bestCount, pair: bestPair, cyclic: bestCyclic } : null;
+}
+
+// ─── Detection: sequential run (ascending or descending, 3+ digits) ─────
+function detectSequentialRun(digits, dir) {
+  const n = digits.length;
+  const nums = Array.from(digits, Number);
+
+  let bestRun = 1, run = 1;
+  for (let i = 1; i < n; i++) {
+    if (nums[i] === nums[i - 1] + dir) run++;
+    else { bestRun = Math.max(bestRun, run); run = 1; }
+  }
+  bestRun = Math.max(bestRun, run);
+
+  let cyclic = false;
+  if (nums[0] === nums[n - 1] + dir) {
+    let head = 1;
+    while (head < n && nums[head] === nums[head - 1] + dir) head++;
+    let tail = 1;
+    while (tail < n && nums[n - 1 - tail] === nums[n - tail] - dir) tail++;
+    const wrap = head + tail;
+    if (wrap > bestRun && wrap >= 3) { bestRun = wrap; cyclic = true; }
+  }
+
+  return bestRun >= 3 ? { run: bestRun, cyclic } : null;
+}
+
+// ─── Naming helpers ─────────────────────────────────────────────────────
+function shkName(run, cyclic)  { return 'sh' + 'lak'.repeat(run - 1) + (cyclic ? ' (cyclic)' : ''); }
+function klshName(run, cyclic) { return 'k' + 'lash'.repeat(run - 1) + (cyclic ? ' (cyclic)' : ''); }
+function kshName(run, cyclic)  { return 'k' + 'shal'.repeat(run - 1) + (cyclic ? ' (cyclic)' : ''); }
+
+// ─── Analyze a plate for all interesting patterns ───────────────────────
+function analyzePlate(digits) {
+  const findings = [];
+
+  const single = detectSingleShlaklak(digits);
+  if (single) findings.push(shkName(single.run, single.cyclic));
+
+  const pair = detectPairShlaklak(digits);
+  if (pair) findings.push(shkName(pair.count, pair.cyclic) + ' (' + pair.pair + ')');
+
+  const asc = detectSequentialRun(digits, 1);
+  if (asc) findings.push(klshName(asc.run, asc.cyclic));
+
+  const desc = detectSequentialRun(digits, -1);
+  if (desc) findings.push(kshName(desc.run, desc.cyclic));
+
+  return findings;
 }
 
 function formatPlate(digits) {
@@ -452,8 +510,8 @@ async function captureAndProcess() {
       const isNew = !state.seenPlates.has(plate);
       state.seenPlates.add(plate);
 
-      const shk = detectShlaklak(plate);
-      const isSpecial = shk !== null;
+      const findings = analyzePlate(plate);
+      const isSpecial = findings.length > 0;
       const isNewSpecial = isSpecial && !state.specialPlates.has(plate);
 
       if (isNewSpecial) {
@@ -461,11 +519,11 @@ async function captureAndProcess() {
       }
 
       // Log it
-      addLogEntry(plate, shk, isNew);
+      addLogEntry(plate, findings, isNew);
 
       // Alert on new special plate
       if (isNewSpecial) {
-        await showAlert(plate, shk);
+        await showAlert(plate, findings);
       }
     }
 
@@ -489,9 +547,9 @@ function updatePlateCount() {
   plateCount.textContent = `${state.seenPlates.size} plates (${state.specialPlates.size} special)`;
 }
 
-function addLogEntry(digits, shk, isNew) {
+function addLogEntry(digits, findings, isNew) {
   const el = document.createElement('div');
-  const isSpecial = shk !== null;
+  const isSpecial = findings.length > 0;
   el.className = 'log-entry ' + (isSpecial ? 'special' : 'normal');
 
   const formatted = formatPlate(digits);
@@ -499,7 +557,7 @@ function addLogEntry(digits, shk, isNew) {
 
   let html = `<span>${formatted}</span>`;
   if (isSpecial) {
-    html += `<span class="label">${shlaklakName(shk.run, shk.cyclic)}</span>`;
+    html += `<span class="label">${findings.join(', ')}</span>`;
   }
   html += `<span class="time">${now}${isNew ? '' : ' (dup)'}</span>`;
   el.innerHTML = html;
@@ -513,12 +571,12 @@ function addLogEntry(digits, shk, isNew) {
   }
 }
 
-async function showAlert(digits, shk) {
+async function showAlert(digits, findings) {
   state.paused = true;
   video.pause();
 
   overlayNumber.textContent = formatPlate(digits);
-  overlayLabel.textContent = shlaklakName(shk.run, shk.cyclic) + '!';
+  overlayLabel.textContent = findings.join(', ') + '!';
   overlay.classList.add('visible');
 
   playAlert();
