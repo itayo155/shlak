@@ -575,16 +575,19 @@ async function extractPlatesFromBatch(frames) {
     contents: [{
       parts: [
         {
-          text: `You are examining ${frames.length} sequential frames from a moving camera. Look at ALL frames carefully and find ALL Israeli vehicle license plates visible in ANY frame. There may be multiple cars/plates. Israeli plates contain only digits, 7 or 8 digits total. Return ONLY the digit sequences, one per line, no dashes, spaces, or other text. Do not repeat the same plate number if it appears in multiple frames. If no plates are visible in any frame, return "NONE".`
+          text: `You are examining ${frames.length} sequential images (numbered 1 to ${frames.length}). Find ALL Israeli vehicle license plates visible in ANY image. Israeli plates contain only digits, 7 or 8 digits total. For each plate found, return the digits followed by a space and the image number(s) where it appears (comma-separated). One plate per line. Example format:\n12345678 1,3\n87654321 2\nIf no plates are visible, return "NONE".`
         },
         ...imageParts
       ]
     }],
     generationConfig: {
       temperature: 0.1,
-      maxOutputTokens: 300,
+      maxOutputTokens: 400,
     }
   };
+
+  const t0 = performance.now();
+  console.log(`[Gemini] Sending ${frames.length} frames (batch)...`);
 
   const resp = await fetch(url, {
     method: 'POST',
@@ -592,14 +595,33 @@ async function extractPlatesFromBatch(frames) {
     body: JSON.stringify(body),
   });
 
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+
   if (!resp.ok) {
     const errText = await resp.text();
+    console.log(`[Gemini] ERROR after ${elapsed}s: ${resp.status}`);
     throw new Error(`Gemini API error: ${resp.status} ${errText.slice(0, 200)}`);
   }
 
   const data = await resp.json();
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  return text.match(/\b\d{7,8}\b/g) || [];
+  console.log(`[Gemini] Response in ${elapsed}s: "${text.trim()}"`);
+
+  // Parse "12345678 1,3" format — extract plate + frame indices
+  const results = [];
+  for (const line of text.split('\n')) {
+    const match = line.match(/(\d{7,8})\s+([\d,\s]+)/);
+    if (match) {
+      const plate = match[1];
+      const frameNums = match[2].split(/[,\s]+/).map(Number).filter(n => n >= 1 && n <= frames.length);
+      results.push({ plate, frameIndices: frameNums.map(n => n - 1) }); // 0-based
+    } else {
+      // Fallback: line is just digits (old format)
+      const digits = line.match(/\b(\d{7,8})\b/);
+      if (digits) results.push({ plate: digits[1], frameIndices: [] });
+    }
+  }
+  return results;
 }
 
 // ─── Async processor loop (drains buffer, sends batches to Gemini) ──────
@@ -616,12 +638,15 @@ async function processLoop() {
   frameBuffer.clear();
   const batchId = saveBatch(batch);
   const batchTime = batch[0]?.timestamp || Date.now();
+  const ages = batch.map(f => ((Date.now() - f.timestamp) / 1000).toFixed(1) + 's');
+  console.log(`[Process] Batch #${batchId}: ${batch.length} frames, ages: [${ages.join(', ')}], buffer had ${frameBuffer.length + batch.length}`);
   setStatus(`Scanning ${batch.length} frames... (buf: ${frameBuffer.length})`, 'active');
 
   try {
-    const plates = await extractPlatesFromBatch(batch);
+    const results = await extractPlatesFromBatch(batch);
+    console.log(`[Gemini] Found ${results.length} plate(s):`, results.map(r => r.plate + ' in frames [' + r.frameIndices.join(',') + ']').join(', ') || 'none');
 
-    for (const plate of plates) {
+    for (const { plate, frameIndices } of results) {
       state.totalCount++;
       const isNew = !state.seenPlates.has(plate);
       state.seenPlates.add(plate);
@@ -634,7 +659,7 @@ async function processLoop() {
         state.specialPlates.add(plate);
       }
 
-      addLogEntry(plate, findings, isNew, batchId, batchTime);
+      addLogEntry(plate, findings, isNew, batchId, batchTime, frameIndices);
 
       if (isNewSpecial) {
         await showAlert(plate, findings, batchId);
@@ -677,12 +702,13 @@ function updatePlateCount() {
   plateCount.textContent = `${state.seenPlates.size} plates (${state.specialPlates.size} special)`;
 }
 
-function addLogEntry(digits, findings, isNew, batchId, batchTime) {
+function addLogEntry(digits, findings, isNew, batchId, batchTime, frameIndices) {
   const el = document.createElement('div');
   const isSpecial = findings.length > 0;
   el.className = 'log-entry ' + (isSpecial ? 'special' : 'normal');
   el.dataset.batchId = batchId;
   el.dataset.plate = digits;
+  el.dataset.frameIndices = JSON.stringify(frameIndices || []);
 
   const formatted = formatPlate(digits);
   const agoSec = Math.round((Date.now() - batchTime) / 1000);
@@ -696,7 +722,10 @@ function addLogEntry(digits, findings, isNew, batchId, batchTime) {
   if (!isNew) html += `<span class="time">(dup)</span>`;
   el.innerHTML = html;
 
-  el.addEventListener('click', () => showImageViewer(parseInt(el.dataset.batchId), el.dataset.plate));
+  el.addEventListener('click', () => {
+    const indices = JSON.parse(el.dataset.frameIndices);
+    showImageViewer(parseInt(el.dataset.batchId), el.dataset.plate, indices);
+  });
 
   plateLog.insertBefore(el, plateLog.firstChild);
 
@@ -726,21 +755,30 @@ async function showAlert(digits, findings, batchId) {
 }
 
 // ─── Image viewer (tap log entry to see source frames) ──────────────────
-function showImageViewer(batchId, plateDigits) {
+function showImageViewer(batchId, plateDigits, frameIndices) {
   const batch = getBatch(batchId);
   if (!batch) return;
 
   viewerPlate.textContent = formatPlate(plateDigits);
   const oldest = batch.frames[0]?.timestamp || Date.now();
   const agoSec = Math.round((Date.now() - oldest) / 1000);
-  viewerInfo.textContent = `${batch.frames.length} frame${batch.frames.length > 1 ? 's' : ''} sent to Gemini \u2022 captured ${agoSec}s ago`;
+  const matchInfo = frameIndices.length > 0
+    ? `plate in frame${frameIndices.length > 1 ? 's' : ''} ${frameIndices.map(i => i + 1).join(', ')}`
+    : 'frame unknown';
+  viewerInfo.textContent = `${batch.frames.length} frames sent \u2022 ${matchInfo} \u2022 ${agoSec}s ago`;
 
   viewerFrames.innerHTML = '';
-  for (const frame of batch.frames) {
+  batch.frames.forEach((frame, i) => {
     const img = document.createElement('img');
     img.src = 'data:image/jpeg;base64,' + frame.base64;
+    if (frameIndices.includes(i)) {
+      img.style.border = '3px solid #ffd700';
+      img.style.boxShadow = '0 0 12px rgba(255, 215, 0, 0.5)';
+    } else {
+      img.style.opacity = '0.4';
+    }
     viewerFrames.appendChild(img);
-  }
+  });
 
   imageViewer.classList.add('visible');
 }
