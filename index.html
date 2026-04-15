@@ -262,7 +262,7 @@
     <span id="plate-count">0 plates</span>
   </div>
   <div id="settings-bar">
-    <label>Rate: <input type="range" id="rate-slider" min="0.5" max="2" step="0.1" value="1"> <span id="rate-value">1.0s</span></label>
+    <label>Batch: <input type="range" id="batch-slider" min="1" max="6" step="1" value="4"> <span id="batch-value">4 frames</span></label>
     <label>Zoom: <input type="range" id="zoom-slider" min="1" max="1" step="0.1" value="1"> <span id="zoom-value">1.0x</span></label>
   </div>
   <div id="plate-log"></div>
@@ -273,12 +273,31 @@
 const state = {
   apiKey: '',
   running: false,
-  processing: false,
   paused: false,
   seenPlates: new Set(),
   specialPlates: new Set(),
   totalCount: 0,
-  captureInterval: null,
+  captureTimerId: null,
+  processTimeoutId: null,
+  batchSize: 4,
+};
+
+// ─── Frame ring buffer ──────────────────────────────────────────────────
+const frameBuffer = {
+  frames: [],
+  maxSize: 30,  // ~6 seconds at 5 FPS, ~2-3 MB
+  push(base64) {
+    this.frames.push({ base64, timestamp: Date.now() });
+    if (this.frames.length > this.maxSize) this.frames.shift();
+  },
+  spread(n) {
+    if (this.frames.length === 0) return [];
+    if (this.frames.length <= n) return this.frames.slice();
+    const step = (this.frames.length - 1) / (n - 1);
+    return Array.from({ length: n }, (_, i) => this.frames[Math.round(i * step)]);
+  },
+  clear() { this.frames = []; },
+  get length() { return this.frames.length; }
 };
 
 // ─── DOM refs ───────────────────────────────────────────────────────────
@@ -295,8 +314,8 @@ const statusText = document.getElementById('status-text');
 const plateCount = document.getElementById('plate-count');
 const plateLog = document.getElementById('plate-log');
 const pauseBtn = document.getElementById('pause-btn');
-const rateSlider = document.getElementById('rate-slider');
-const rateValue = document.getElementById('rate-value');
+const batchSlider = document.getElementById('batch-slider');
+const batchValue = document.getElementById('batch-value');
 const zoomSlider = document.getElementById('zoom-slider');
 const zoomValue = document.getElementById('zoom-value');
 const zoomLabel = document.getElementById('zoom-label');
@@ -313,7 +332,6 @@ function ensureAudio() {
 function playAlert() {
   try {
     const ctx = ensureAudio();
-    // Three-tone rising alert
     [523, 659, 784].forEach((freq, i) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
@@ -362,7 +380,7 @@ function detectPairShlaklak(digits) {
 
   for (let start = 0; start < n; start++) {
     const a = digits[start], b = digits[(start + 1) % n];
-    if (a === b) continue; // same-digit pairs covered by single shlaklak
+    if (a === b) continue;
 
     let count = 1;
     for (let k = 1; k < maxReps; k++) {
@@ -430,7 +448,6 @@ function analyzePlate(digits) {
 }
 
 function formatPlate(digits) {
-  // Format as XX-XXX-XX or XXX-XX-XXX
   if (digits.length === 7) {
     return digits.slice(0, 2) + '-' + digits.slice(2, 5) + '-' + digits.slice(5, 7);
   } else if (digits.length === 8) {
@@ -439,27 +456,37 @@ function formatPlate(digits) {
   return digits;
 }
 
-// ─── Gemini API call ────────────────────────────────────────────────────
-async function extractPlates(imageBase64) {
+// ─── Fast frame capture (runs at 5 FPS, independent of Gemini) ──────────
+function captureFrame() {
+  if (state.paused || !state.running) return;
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  if (canvas.width === 0 || canvas.height === 0) return;
+  ctx.drawImage(video, 0, 0);
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+  frameBuffer.push(dataUrl.split(',')[1]);
+}
+
+// ─── Gemini API call (batch: multiple images in one call) ───────────────
+async function extractPlatesFromBatch(frames) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${state.apiKey}`;
+
+  const imageParts = frames.map(f => ({
+    inlineData: { mimeType: 'image/jpeg', data: f.base64 }
+  }));
 
   const body = {
     contents: [{
       parts: [
         {
-          text: `Look at this image carefully and find ALL Israeli vehicle license plates visible. There may be multiple plates (e.g. parked cars on a street). Israeli plates contain only digits, 7 or 8 digits total. Return ONLY the digit sequences, one per line, no dashes, spaces, or other text. If no plates are visible, return "NONE".`
+          text: `You are examining ${frames.length} sequential frames from a moving camera. Look at ALL frames carefully and find ALL Israeli vehicle license plates visible in ANY frame. There may be multiple cars/plates. Israeli plates contain only digits, 7 or 8 digits total. Return ONLY the digit sequences, one per line, no dashes, spaces, or other text. Do not repeat the same plate number if it appears in multiple frames. If no plates are visible in any frame, return "NONE".`
         },
-        {
-          inlineData: {
-            mimeType: 'image/jpeg',
-            data: imageBase64
-          }
-        }
+        ...imageParts
       ]
     }],
     generationConfig: {
       temperature: 0.1,
-      maxOutputTokens: 200,
+      maxOutputTokens: 300,
     }
   };
 
@@ -476,34 +503,25 @@ async function extractPlates(imageBase64) {
 
   const data = await resp.json();
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-  // Extract digit sequences of 7-8 digits
-  const matches = text.match(/\b\d{7,8}\b/g);
-  return matches || [];
+  return text.match(/\b\d{7,8}\b/g) || [];
 }
 
-// ─── Capture & process a frame ──────────────────────────────────────────
-async function captureAndProcess() {
-  if (state.processing || state.paused || !state.running) return;
-  state.processing = true;
-  setStatus('Scanning...', 'active');
+// ─── Async processor loop (drains buffer, sends batches to Gemini) ──────
+async function processLoop() {
+  if (!state.running || state.paused) return;
+
+  if (frameBuffer.length < state.batchSize) {
+    // Not enough frames yet, wait and retry
+    state.processTimeoutId = setTimeout(processLoop, 500);
+    return;
+  }
+
+  const batch = frameBuffer.spread(state.batchSize);
+  frameBuffer.clear();
+  setStatus(`Scanning ${batch.length} frames... (buf: ${frameBuffer.length})`, 'active');
 
   try {
-    // Capture frame
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    if (canvas.width === 0 || canvas.height === 0) {
-      state.processing = false;
-      return;
-    }
-    ctx.drawImage(video, 0, 0);
-
-    // Convert to base64 JPEG
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-    const base64 = dataUrl.split(',')[1];
-
-    // Call Gemini
-    const plates = await extractPlates(base64);
+    const plates = await extractPlatesFromBatch(batch);
 
     for (const plate of plates) {
       state.totalCount++;
@@ -518,23 +536,37 @@ async function captureAndProcess() {
         state.specialPlates.add(plate);
       }
 
-      // Log it
       addLogEntry(plate, findings, isNew);
 
-      // Alert on new special plate
       if (isNewSpecial) {
         await showAlert(plate, findings);
       }
     }
 
     updatePlateCount();
-    setStatus('Watching...', 'active');
+    setStatus(`Watching... (buf: ${frameBuffer.length})`, 'active');
   } catch (err) {
     console.error(err);
-    setStatus(err.message.slice(0, 80), 'error');
+    setStatus(err.message.slice(0, 100), 'error');
   }
 
-  state.processing = false;
+  // Schedule next batch immediately (Gemini latency is the natural throttle)
+  if (state.running && !state.paused) {
+    state.processTimeoutId = setTimeout(processLoop, 100);
+  }
+}
+
+function startCapture() {
+  frameBuffer.clear();
+  state.captureTimerId = setInterval(captureFrame, 200); // 5 FPS
+  processLoop();
+}
+
+function stopCapture() {
+  clearInterval(state.captureTimerId);
+  clearTimeout(state.processTimeoutId);
+  state.captureTimerId = null;
+  state.processTimeoutId = null;
 }
 
 // ─── UI helpers ─────────────────────────────────────────────────────────
@@ -562,10 +594,8 @@ function addLogEntry(digits, findings, isNew) {
   html += `<span class="time">${now}${isNew ? '' : ' (dup)'}</span>`;
   el.innerHTML = html;
 
-  // Prepend (newest first)
   plateLog.insertBefore(el, plateLog.firstChild);
 
-  // Keep log manageable
   while (plateLog.children.length > 100) {
     plateLog.removeChild(plateLog.lastChild);
   }
@@ -573,6 +603,7 @@ function addLogEntry(digits, findings, isNew) {
 
 async function showAlert(digits, findings) {
   state.paused = true;
+  clearInterval(state.captureTimerId); // stop capturing frozen frames
   video.pause();
 
   overlayNumber.textContent = formatPlate(digits);
@@ -581,25 +612,20 @@ async function showAlert(digits, findings) {
 
   playAlert();
 
-  // Pause for 3 seconds
   await new Promise(r => setTimeout(r, 3000));
 
   overlay.classList.remove('visible');
   video.play();
   state.paused = false;
+  // Resume capture and processing
+  state.captureTimerId = setInterval(captureFrame, 200);
+  state.processTimeoutId = setTimeout(processLoop, 100);
 }
 
-// ─── Rate slider ────────────────────────────────────────────────────────
-function getRate() {
-  return parseFloat(rateSlider.value) * 1000;
-}
-
-rateSlider.addEventListener('input', () => {
-  rateValue.textContent = parseFloat(rateSlider.value).toFixed(1) + 's';
-  if (state.running) {
-    clearInterval(state.captureInterval);
-    state.captureInterval = setInterval(captureAndProcess, getRate());
-  }
+// ─── Batch slider ───────────────────────────────────────────────────────
+batchSlider.addEventListener('input', () => {
+  state.batchSize = parseInt(batchSlider.value);
+  batchValue.textContent = state.batchSize + ' frames';
 });
 
 // ─── Zoom (pinch + slider) ──────────────────────────────────────────────
@@ -670,18 +696,16 @@ cameraContainer.addEventListener('touchend', (e) => {
 // ─── Pause / Resume ─────────────────────────────────────────────────────
 pauseBtn.addEventListener('click', () => {
   if (state.running) {
-    // Pause
     state.running = false;
-    clearInterval(state.captureInterval);
+    stopCapture();
     video.pause();
     pauseBtn.textContent = 'Resume';
     pauseBtn.className = 'paused';
     setStatus('Paused', '');
   } else {
-    // Resume
     video.play();
     state.running = true;
-    state.captureInterval = setInterval(captureAndProcess, getRate());
+    startCapture();
     pauseBtn.textContent = 'Pause';
     pauseBtn.className = 'running';
     setStatus('Watching...', 'active');
@@ -712,11 +736,10 @@ startBtn.addEventListener('click', async () => {
     pauseBtn.textContent = 'Pause';
     pauseBtn.className = 'running';
     settingsBar.style.display = 'flex';
-    setStatus('Watching...', 'active');
     state.running = true;
 
-    // Start capture loop
-    state.captureInterval = setInterval(captureAndProcess, getRate());
+    startCapture();
+    setStatus('Watching... (buf: 0)', 'active');
   } catch (err) {
     alert('Camera error: ' + err.message);
   }
