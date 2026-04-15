@@ -233,9 +233,84 @@
     font-size: 0.75rem;
     color: #666;
   }
+
+  .log-entry .ago {
+    font-size: 0.7rem;
+    color: #999;
+    font-style: italic;
+  }
+
+  .log-entry { cursor: pointer; }
+
+  /* Image viewer modal */
+  #image-viewer {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.92);
+    z-index: 100;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+
+  #image-viewer.visible { display: flex; }
+
+  #image-viewer .viewer-header {
+    color: #ffd700;
+    font-size: 1.1rem;
+    font-weight: bold;
+    font-family: 'Courier New', monospace;
+    margin-bottom: 8px;
+    text-align: center;
+  }
+
+  #image-viewer .viewer-info {
+    color: #888;
+    font-size: 0.8rem;
+    margin-bottom: 12px;
+    text-align: center;
+  }
+
+  #image-viewer .viewer-frames {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    max-width: 100%;
+    padding: 4px;
+    flex-shrink: 0;
+  }
+
+  #image-viewer .viewer-frames img {
+    height: 40vh;
+    max-height: 400px;
+    border-radius: 8px;
+    border: 2px solid #444;
+    object-fit: contain;
+    flex-shrink: 0;
+  }
+
+  #image-viewer .viewer-close {
+    margin-top: 16px;
+    padding: 10px 32px;
+    font-size: 1rem;
+    border: 1px solid #555;
+    border-radius: 8px;
+    background: #333;
+    color: #fff;
+    cursor: pointer;
+  }
 </style>
 </head>
 <body>
+
+<div id="image-viewer">
+  <div class="viewer-header" id="viewer-plate"></div>
+  <div class="viewer-info" id="viewer-info"></div>
+  <div class="viewer-frames" id="viewer-frames"></div>
+  <button class="viewer-close" id="viewer-close">Close</button>
+</div>
 
 <div id="camera-container">
   <video id="video" autoplay playsinline muted></video>
@@ -300,6 +375,22 @@ const frameBuffer = {
   get length() { return this.frames.length; }
 };
 
+// ─── Batch archive (keeps source images for each Gemini call) ───────────
+const batchArchive = [];  // [{id, frames: [{base64, timestamp}]}]
+const MAX_BATCHES = 100;
+let nextBatchId = 0;
+
+function saveBatch(frames) {
+  const id = nextBatchId++;
+  batchArchive.push({ id, frames: frames.map(f => ({ base64: f.base64, timestamp: f.timestamp })) });
+  while (batchArchive.length > MAX_BATCHES) batchArchive.shift();
+  return id;
+}
+
+function getBatch(id) {
+  return batchArchive.find(b => b.id === id);
+}
+
 // ─── DOM refs ───────────────────────────────────────────────────────────
 const video = document.getElementById('video');
 const canvas = document.getElementById('canvas');
@@ -320,6 +411,11 @@ const zoomSlider = document.getElementById('zoom-slider');
 const zoomValue = document.getElementById('zoom-value');
 const zoomLabel = document.getElementById('zoom-label');
 const settingsBar = document.getElementById('settings-bar');
+const imageViewer = document.getElementById('image-viewer');
+const viewerPlate = document.getElementById('viewer-plate');
+const viewerInfo = document.getElementById('viewer-info');
+const viewerFrames = document.getElementById('viewer-frames');
+const viewerClose = document.getElementById('viewer-close');
 
 // ─── Audio ──────────────────────────────────────────────────────────────
 let audioCtx = null;
@@ -518,6 +614,8 @@ async function processLoop() {
 
   const batch = frameBuffer.spread(state.batchSize);
   frameBuffer.clear();
+  const batchId = saveBatch(batch);
+  const batchTime = batch[0]?.timestamp || Date.now();
   setStatus(`Scanning ${batch.length} frames... (buf: ${frameBuffer.length})`, 'active');
 
   try {
@@ -536,10 +634,10 @@ async function processLoop() {
         state.specialPlates.add(plate);
       }
 
-      addLogEntry(plate, findings, isNew);
+      addLogEntry(plate, findings, isNew, batchId, batchTime);
 
       if (isNewSpecial) {
-        await showAlert(plate, findings);
+        await showAlert(plate, findings, batchId);
       }
     }
 
@@ -579,20 +677,26 @@ function updatePlateCount() {
   plateCount.textContent = `${state.seenPlates.size} plates (${state.specialPlates.size} special)`;
 }
 
-function addLogEntry(digits, findings, isNew) {
+function addLogEntry(digits, findings, isNew, batchId, batchTime) {
   const el = document.createElement('div');
   const isSpecial = findings.length > 0;
   el.className = 'log-entry ' + (isSpecial ? 'special' : 'normal');
+  el.dataset.batchId = batchId;
+  el.dataset.plate = digits;
 
   const formatted = formatPlate(digits);
-  const now = new Date().toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const agoSec = Math.round((Date.now() - batchTime) / 1000);
+  const agoText = agoSec <= 1 ? 'just now' : agoSec + 's ago';
 
   let html = `<span>${formatted}</span>`;
   if (isSpecial) {
     html += `<span class="label">${findings.join(', ')}</span>`;
   }
-  html += `<span class="time">${now}${isNew ? '' : ' (dup)'}</span>`;
+  html += `<span class="ago">${agoText}</span>`;
+  if (!isNew) html += `<span class="time">(dup)</span>`;
   el.innerHTML = html;
+
+  el.addEventListener('click', () => showImageViewer(parseInt(el.dataset.batchId), el.dataset.plate));
 
   plateLog.insertBefore(el, plateLog.firstChild);
 
@@ -601,9 +705,9 @@ function addLogEntry(digits, findings, isNew) {
   }
 }
 
-async function showAlert(digits, findings) {
+async function showAlert(digits, findings, batchId) {
   state.paused = true;
-  clearInterval(state.captureTimerId); // stop capturing frozen frames
+  clearInterval(state.captureTimerId);
   video.pause();
 
   overlayNumber.textContent = formatPlate(digits);
@@ -617,10 +721,34 @@ async function showAlert(digits, findings) {
   overlay.classList.remove('visible');
   video.play();
   state.paused = false;
-  // Resume capture and processing
   state.captureTimerId = setInterval(captureFrame, 200);
   state.processTimeoutId = setTimeout(processLoop, 100);
 }
+
+// ─── Image viewer (tap log entry to see source frames) ──────────────────
+function showImageViewer(batchId, plateDigits) {
+  const batch = getBatch(batchId);
+  if (!batch) return;
+
+  viewerPlate.textContent = formatPlate(plateDigits);
+  const oldest = batch.frames[0]?.timestamp || Date.now();
+  const agoSec = Math.round((Date.now() - oldest) / 1000);
+  viewerInfo.textContent = `${batch.frames.length} frame${batch.frames.length > 1 ? 's' : ''} sent to Gemini \u2022 captured ${agoSec}s ago`;
+
+  viewerFrames.innerHTML = '';
+  for (const frame of batch.frames) {
+    const img = document.createElement('img');
+    img.src = 'data:image/jpeg;base64,' + frame.base64;
+    viewerFrames.appendChild(img);
+  }
+
+  imageViewer.classList.add('visible');
+}
+
+viewerClose.addEventListener('click', () => {
+  imageViewer.classList.remove('visible');
+  viewerFrames.innerHTML = ''; // free memory
+});
 
 // ─── Batch slider ───────────────────────────────────────────────────────
 batchSlider.addEventListener('input', () => {
