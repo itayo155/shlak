@@ -349,13 +349,17 @@ const state = {
   apiKey: '',
   running: false,
   paused: false,
-  seenPlates: new Set(),
+  seenPlates: new Set(),        // plates confirmed (seen 2+ batches)
   specialPlates: new Set(),
   totalCount: 0,
   captureTimerId: null,
   processTimeoutId: null,
   batchSize: 4,
 };
+
+// ─── Cross-batch validation (plate must appear in 2+ batches) ───────────
+const pendingPlates = new Map(); // plate -> { count, firstBatchId, firstBatchTime, firstFrameIndices }
+const REQUIRED_SIGHTINGS = 2;
 
 // ─── Frame ring buffer ──────────────────────────────────────────────────
 const frameBuffer = {
@@ -575,7 +579,7 @@ async function extractPlatesFromBatch(frames) {
     contents: [{
       parts: [
         {
-          text: `You are examining ${frames.length} sequential images (numbered 1 to ${frames.length}). Find ALL Israeli vehicle license plates visible in ANY image. Israeli plates contain only digits, 7 or 8 digits total. For each plate found, return the digits followed by a space and the image number(s) where it appears (comma-separated). One plate per line. Example format:\n12345678 1,3\n87654321 2\nIf no plates are visible, return "NONE".`
+          text: `You are examining ${frames.length} sequential images (numbered 1 to ${frames.length}). Look for Israeli vehicle license plates. Israeli plates are yellow with ONLY digits (7 or 8 digits, no letters). IMPORTANT: Only report plates you can actually read clearly. If you cannot read the digits with confidence, do NOT guess. If no plates are clearly visible, you MUST return just "NONE". For each plate, return the digits then a space then the image number(s), comma-separated. One plate per line. Format: DIGITS IMAGES`
         },
         ...imageParts
       ]
@@ -647,22 +651,54 @@ async function processLoop() {
     console.log(`[Gemini] Found ${results.length} plate(s):`, results.map(r => r.plate + ' in frames [' + r.frameIndices.join(',') + ']').join(', ') || 'none');
 
     for (const { plate, frameIndices } of results) {
-      state.totalCount++;
-      const isNew = !state.seenPlates.has(plate);
-      state.seenPlates.add(plate);
-
-      const findings = analyzePlate(plate);
-      const isSpecial = findings.length > 0;
-      const isNewSpecial = isSpecial && !state.specialPlates.has(plate);
-
-      if (isNewSpecial) {
-        state.specialPlates.add(plate);
+      // Already confirmed plate — just log as dup
+      if (state.seenPlates.has(plate)) {
+        addLogEntry(plate, analyzePlate(plate), false, batchId, batchTime, frameIndices);
+        continue;
       }
 
-      addLogEntry(plate, findings, isNew, batchId, batchTime, frameIndices);
+      // Cross-batch validation: need 2+ independent sightings
+      const pending = pendingPlates.get(plate);
+      if (!pending) {
+        // First sighting — hold in pending, don't show yet
+        pendingPlates.set(plate, { count: 1, firstBatchId: batchId, firstBatchTime: batchTime, firstFrameIndices: frameIndices });
+        console.log(`[Validate] ${plate}: first sighting (pending, need ${REQUIRED_SIGHTINGS})`);
+        continue;
+      }
 
-      if (isNewSpecial) {
-        await showAlert(plate, findings, batchId);
+      // Seen before — increment
+      pending.count++;
+      console.log(`[Validate] ${plate}: sighting #${pending.count}`);
+
+      if (pending.count >= REQUIRED_SIGHTINGS) {
+        // Confirmed! Promote to seen
+        pendingPlates.delete(plate);
+        state.seenPlates.add(plate);
+        state.totalCount++;
+
+        const findings = analyzePlate(plate);
+        const isSpecial = findings.length > 0;
+        const isNewSpecial = isSpecial && !state.specialPlates.has(plate);
+
+        if (isNewSpecial) {
+          state.specialPlates.add(plate);
+        }
+
+        addLogEntry(plate, findings, true, batchId, batchTime, frameIndices);
+        console.log(`[Validate] ${plate}: CONFIRMED ✓ ${isSpecial ? '(' + findings.join(', ') + ')' : ''}`);
+
+        if (isNewSpecial) {
+          await showAlert(plate, findings, batchId);
+        }
+      }
+    }
+
+    // Expire old pending plates (not seen again within 30 seconds)
+    const now = Date.now();
+    for (const [plate, info] of pendingPlates) {
+      if (now - info.firstBatchTime > 30000) {
+        console.log(`[Validate] ${plate}: expired (single sighting, likely hallucination)`);
+        pendingPlates.delete(plate);
       }
     }
 
@@ -699,7 +735,8 @@ function setStatus(text, cls) {
 }
 
 function updatePlateCount() {
-  plateCount.textContent = `${state.seenPlates.size} plates (${state.specialPlates.size} special)`;
+  const pendingStr = pendingPlates.size > 0 ? `, ${pendingPlates.size} pending` : '';
+  plateCount.textContent = `${state.seenPlates.size} plates (${state.specialPlates.size} special${pendingStr})`;
 }
 
 function addLogEntry(digits, findings, isNew, batchId, batchTime, frameIndices) {
