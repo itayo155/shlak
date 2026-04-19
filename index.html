@@ -242,6 +242,13 @@
 
   .log-entry { cursor: pointer; }
 
+  .log-entry.tentative { opacity: 0.55; }
+  .log-entry.tentative .tentative-mark {
+    color: #888;
+    font-size: 0.75rem;
+    font-style: italic;
+  }
+
   /* Image viewer modal */
   #image-viewer {
     display: none;
@@ -651,53 +658,41 @@ async function processLoop() {
     console.log(`[Gemini] Found ${results.length} plate(s):`, results.map(r => r.plate + ' in frames [' + r.frameIndices.join(',') + ']').join(', ') || 'none');
 
     for (const { plate, frameIndices } of results) {
-      // Already confirmed plate — just log as dup
-      if (state.seenPlates.has(plate)) {
-        addLogEntry(plate, analyzePlate(plate), false, batchId, batchTime, frameIndices);
-        continue;
-      }
+      state.totalCount++;
+      const findings = analyzePlate(plate);
+      const isSpecial = findings.length > 0;
 
-      // Cross-batch validation: need 2+ independent sightings
-      const pending = pendingPlates.get(plate);
-      if (!pending) {
-        // First sighting — hold in pending, don't show yet
-        pendingPlates.set(plate, { count: 1, firstBatchId: batchId, firstBatchTime: batchTime, firstFrameIndices: frameIndices });
-        console.log(`[Validate] ${plate}: first sighting (pending, need ${REQUIRED_SIGHTINGS})`);
-        continue;
-      }
+      // Track sightings (for cross-batch confirmation)
+      const prev = pendingPlates.get(plate) || { count: 0 };
+      const sightingCount = prev.count + 1;
+      pendingPlates.set(plate, { count: sightingCount, lastBatchTime: batchTime });
 
-      // Seen before — increment
-      pending.count++;
-      console.log(`[Validate] ${plate}: sighting #${pending.count}`);
+      const wasConfirmed = state.seenPlates.has(plate);
+      const justConfirmed = !wasConfirmed && sightingCount >= REQUIRED_SIGHTINGS;
 
-      if (pending.count >= REQUIRED_SIGHTINGS) {
-        // Confirmed! Promote to seen
-        pendingPlates.delete(plate);
+      // Log every sighting with a tentative/confirmed indicator
+      const isLoggedAsNew = !wasConfirmed;
+      addLogEntry(plate, findings, isLoggedAsNew, batchId, batchTime, frameIndices, sightingCount >= REQUIRED_SIGHTINGS);
+
+      if (justConfirmed) {
         state.seenPlates.add(plate);
-        state.totalCount++;
+        console.log(`[Validate] ${plate}: CONFIRMED ✓ (sighting #${sightingCount})${isSpecial ? ' ' + findings.join(', ') : ''}`);
 
-        const findings = analyzePlate(plate);
-        const isSpecial = findings.length > 0;
-        const isNewSpecial = isSpecial && !state.specialPlates.has(plate);
-
-        if (isNewSpecial) {
+        // Only alert on CONFIRMED special plates
+        if (isSpecial && !state.specialPlates.has(plate)) {
           state.specialPlates.add(plate);
-        }
-
-        addLogEntry(plate, findings, true, batchId, batchTime, frameIndices);
-        console.log(`[Validate] ${plate}: CONFIRMED ✓ ${isSpecial ? '(' + findings.join(', ') + ')' : ''}`);
-
-        if (isNewSpecial) {
           await showAlert(plate, findings, batchId);
         }
+      } else if (!wasConfirmed) {
+        console.log(`[Validate] ${plate}: sighting #${sightingCount}/${REQUIRED_SIGHTINGS} (tentative)`);
       }
     }
 
-    // Expire old pending plates (not seen again within 30 seconds)
+    // Expire old pending records (not seen again within 30 seconds)
     const now = Date.now();
     for (const [plate, info] of pendingPlates) {
-      if (now - info.firstBatchTime > 30000) {
-        console.log(`[Validate] ${plate}: expired (single sighting, likely hallucination)`);
+      if (now - info.lastBatchTime > 30000 && !state.seenPlates.has(plate)) {
+        console.log(`[Validate] ${plate}: expired unconfirmed (likely hallucination)`);
         pendingPlates.delete(plate);
       }
     }
@@ -735,14 +730,18 @@ function setStatus(text, cls) {
 }
 
 function updatePlateCount() {
-  const pendingStr = pendingPlates.size > 0 ? `, ${pendingPlates.size} pending` : '';
-  plateCount.textContent = `${state.seenPlates.size} plates (${state.specialPlates.size} special${pendingStr})`;
+  const tentativeCount = pendingPlates.size - state.seenPlates.size;
+  const tentStr = tentativeCount > 0 ? `, ${tentativeCount}?` : '';
+  plateCount.textContent = `${state.seenPlates.size} plates (${state.specialPlates.size} special${tentStr})`;
 }
 
-function addLogEntry(digits, findings, isNew, batchId, batchTime, frameIndices) {
+function addLogEntry(digits, findings, isNew, batchId, batchTime, frameIndices, confirmed) {
   const el = document.createElement('div');
   const isSpecial = findings.length > 0;
-  el.className = 'log-entry ' + (isSpecial ? 'special' : 'normal');
+  const classes = ['log-entry'];
+  classes.push(isSpecial ? 'special' : 'normal');
+  if (!confirmed) classes.push('tentative');
+  el.className = classes.join(' ');
   el.dataset.batchId = batchId;
   el.dataset.plate = digits;
   el.dataset.frameIndices = JSON.stringify(frameIndices || []);
@@ -751,7 +750,7 @@ function addLogEntry(digits, findings, isNew, batchId, batchTime, frameIndices) 
   const agoSec = Math.round((Date.now() - batchTime) / 1000);
   const agoText = agoSec <= 1 ? 'just now' : agoSec + 's ago';
 
-  let html = `<span>${formatted}</span>`;
+  let html = `<span>${formatted}${confirmed ? '' : ' <span class="tentative-mark">?</span>'}</span>`;
   if (isSpecial) {
     html += `<span class="label">${findings.join(', ')}</span>`;
   }
